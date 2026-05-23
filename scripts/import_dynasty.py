@@ -444,6 +444,430 @@ def _extract_holder_traits(
         )
 
 
+# ---------- Phase 0.1.1: additional extractors ----------
+
+
+def _extract_battles(
+    *, parsed: dict, holder_ids: set[str], chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str, from_year: int, to_year: int,
+):
+    """Past battles from ``combats.combat_results``.
+
+    Each combat is a single tactical engagement (not a whole war). We keep
+    the ones where a primary-title holder commanded one of the sides,
+    and where the combat actually resolved (``winning_side >= 0`` and
+    ``end_date`` not the sentinel ``1.1.1``).
+    """
+    combats_root = parsed.get("combats") or {}
+    combat_results = combats_root.get("combat_results")
+    if not isinstance(combat_results, dict):
+        return
+    for cid, c in combat_results.items():
+        if not isinstance(c, dict):
+            continue
+        end = _parse_date(c.get("end_date"))
+        ws = c.get("winning_side")
+        # Filter to completed combats only. CK3 stores ongoing engagements
+        # in the same table with end_date='1.1.1' and winning_side=-1.
+        if not end or end == (1, 1, 1) or (isinstance(ws, int) and ws < 0):
+            continue
+        start = _parse_date(c.get("start_date")) or end
+        y, m, d = start
+        if y < from_year or y > to_year:
+            continue
+        att = c.get("attacker") or {}
+        deff = c.get("defender") or {}
+        att_cmd = str(att.get("commander")) if isinstance(att, dict) and att.get("commander") else None
+        def_cmd = str(deff.get("commander")) if isinstance(deff, dict) and deff.get("commander") else None
+        att_main = str(att.get("main_participant")) if isinstance(att, dict) and att.get("main_participant") else None
+        def_main = str(deff.get("main_participant")) if isinstance(deff, dict) and deff.get("main_participant") else None
+        commanders_and_principals = {x for x in (att_cmd, def_cmd, att_main, def_main) if x}
+        if not (commanders_and_principals & holder_ids):
+            continue
+        # Casualties: starting - surviving on each side.
+        def _cas(side):
+            if not isinstance(side, dict):
+                return None
+            init = side.get("inital_soldiers")  # CK3 spells it 'inital'
+            surv = side.get("surviving_soldiers")
+            if isinstance(init, (int, float)) and isinstance(surv, (int, float)):
+                return max(0, int(init) - int(surv))
+            return None
+        cas = Casualties(
+            attacker_dead=_cas(att) if isinstance(att, dict) else None,
+            defender_dead=_cas(deff) if isinstance(deff, dict) else None,
+        )
+        # Pick the holder as primary actor (whichever side they were on).
+        anchor = None
+        for cand in (att_cmd, def_cmd, att_main, def_main):
+            if cand and cand in holder_ids:
+                anchor = cand
+                break
+        if anchor is None:
+            continue
+        actor = _enrich(_make_actor(anchor, chars))
+        # Faction labels.
+        factions = []
+        for x in (att_cmd, att_main):
+            if x:
+                factions.append(Faction(
+                    name=_decode_ck3_name(_make_actor(x, chars).name),
+                    side=FactionSide.ATTACKER,
+                ))
+                break
+        for x in (def_cmd, def_main):
+            if x:
+                factions.append(Faction(
+                    name=_decode_ck3_name(_make_actor(x, chars).name),
+                    side=FactionSide.DEFENDER,
+                ))
+                break
+        outcome = Outcome.ATTACKER_VICTORY if ws == 0 else (
+            Outcome.DEFENDER_VICTORY if ws == 1 else Outcome.UNKNOWN
+        )
+        # Did our anchor win?
+        anchor_on_attacker = anchor in {att_cmd, att_main}
+        anchor_won = (
+            (anchor_on_attacker and outcome == Outcome.ATTACKER_VICTORY)
+            or (not anchor_on_attacker and outcome == Outcome.DEFENDER_VICTORY)
+        )
+        eid = make_event_id(
+            Source.SAVE_IMPORT, EventType.BATTLE, y,
+            salt_parts=[str(cid), anchor, str(c.get("location"))],
+        )
+        yield ChronicleEvent(
+            event_id=eid, source=Source.SAVE_IMPORT, type=EventType.BATTLE,
+            year=y, month=m, day=d,
+            primary_actors=[actor], factions=factions,
+            casualties=cas, outcome=outcome,
+            tags=[f"province:{c.get('location')}",
+                  ("victory" if anchor_won else "defeat"),
+                  ("attacker" if anchor_on_attacker else "defender"),
+                  f"title:{title_label}"]
+                 + ([f"house:{house_name}"] if house_name else []),
+            raw_excerpt=json.dumps({
+                "location_province": c.get("location"),
+                "end_date": c.get("end_date"),
+                "attacker_initial": att.get("inital_soldiers") if isinstance(att, dict) else None,
+                "attacker_surviving": att.get("surviving_soldiers") if isinstance(att, dict) else None,
+                "defender_initial": deff.get("inital_soldiers") if isinstance(deff, dict) else None,
+                "defender_surviving": deff.get("surviving_soldiers") if isinstance(deff, dict) else None,
+            }, ensure_ascii=False)[:500],
+            world_context=world_context,
+        )
+
+
+def _extract_player_schemes(
+    *, parsed: dict, current_holder_id: str, chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str,
+):
+    """Schemes the reigning ruler is actively running (or that target him).
+
+    Schemes are still in flight — the chronicler records them as palace
+    intrigue (own scheme) or as a perceived threat (targeting scheme).
+    """
+    schemes_active = ((parsed.get("schemes") or {}).get("active")) or {}
+    holder = chars.get(current_holder_id) or {}
+    ad = holder.get("alive_data") or {}
+    own = ad.get("schemes") or []
+    targeting = ad.get("targeting_schemes") or []
+    for sid, role in [(s, "owner") for s in own] + [(s, "target") for s in targeting]:
+        s = schemes_active.get(str(sid))
+        if not isinstance(s, dict):
+            continue
+        scheme_type = s.get("type") or "scheme"
+        date = _parse_date(s.get("date"))
+        if not date:
+            continue
+        y, m, d = date
+        owner_id = str(s.get("owner") or current_holder_id)
+        target = s.get("target")
+        target_id = None
+        if isinstance(target, dict) and target.get("target") is not None:
+            target_id = str(target["target"])
+        # Treat "ongoing" as a scheme_active marker (chronicler can frame it
+        # as palace intrigue without claiming an outcome).
+        anchor_id = current_holder_id
+        actor = _enrich(_make_actor(anchor_id, chars))
+        eid = make_event_id(
+            Source.SAVE_IMPORT, EventType.SCHEME_ACTIVE, y,
+            salt_parts=[str(sid), scheme_type, owner_id, target_id or "no_target"],
+        )
+        target_name = (
+            _decode_ck3_name(_make_actor(target_id, chars).name)
+            if target_id and chars.get(target_id) else None
+        )
+        owner_name = (
+            _decode_ck3_name(_make_actor(owner_id, chars).name)
+            if owner_id and chars.get(owner_id) else None
+        )
+        yield ChronicleEvent(
+            event_id=eid, source=Source.SAVE_IMPORT, type=EventType.SCHEME_ACTIVE,
+            year=y, month=m, day=d,
+            primary_actors=[actor], outcome=Outcome.UNKNOWN,
+            tags=["ongoing", f"scheme:{scheme_type}", f"role:{role}",
+                  f"title:{title_label}"]
+                 + ([f"house:{house_name}"] if house_name else []),
+            raw_excerpt=json.dumps({
+                "scheme_type": scheme_type,
+                "role": role,
+                "owner_name": owner_name,
+                "target_name": target_name,
+                "progress": s.get("progress"),
+                "secrecy": s.get("secrecy"),
+            }, ensure_ascii=False)[:400],
+            world_context=world_context,
+        )
+
+
+def _extract_player_stories(
+    *, parsed: dict, current_holder_id: str, chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str, from_year: int, to_year: int,
+):
+    """Active CK3 stories whose ``owner`` is the reigning ruler.
+
+    Stories track multi-step arcs (pet dog, journey, vassal feud, etc.).
+    Each is anchored at its first listed date.
+    """
+    stories = ((parsed.get("stories") or {}).get("active")) or {}
+    if not isinstance(stories, dict):
+        return
+    for sid, s in stories.items():
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("owner") or "") != current_holder_id:
+            continue
+        dates = s.get("dates") or []
+        date = _parse_date(dates[0]) if isinstance(dates, list) and dates else None
+        if not date:
+            continue
+        y, m, d = date
+        if y < from_year or y > to_year:
+            continue
+        cycle = s.get("story_cycle") or "story"
+        # Flatten variable flags for the brief.
+        var_flags: list[str] = []
+        v = s.get("variables") or {}
+        if isinstance(v, dict):
+            for d_ in (v.get("data") or []):
+                if isinstance(d_, dict):
+                    flag = d_.get("flag")
+                    payload = d_.get("data") or {}
+                    if isinstance(payload, dict):
+                        var_flags.append(f"{flag}={payload.get('flag', payload.get('identity', '?'))}")
+        actor = _enrich(_make_actor(current_holder_id, chars))
+        eid = make_event_id(
+            Source.SAVE_IMPORT, EventType.STORY_EVENT, y,
+            salt_parts=[str(sid), cycle, current_holder_id],
+        )
+        yield ChronicleEvent(
+            event_id=eid, source=Source.SAVE_IMPORT, type=EventType.STORY_EVENT,
+            year=y, month=m, day=d,
+            primary_actors=[actor], outcome=Outcome.UNKNOWN,
+            tags=[f"story:{cycle}", f"title:{title_label}"]
+                 + ([f"house:{house_name}"] if house_name else []),
+            raw_excerpt=json.dumps({
+                "story_cycle": cycle,
+                "variables": var_flags,
+                "all_dates": dates,
+            }, ensure_ascii=False)[:500],
+            world_context=world_context,
+        )
+
+
+def _extract_artifacts(
+    *, parsed: dict, holder_ids: set[str], chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str, from_year: int, to_year: int,
+    max_artifacts: int = 8,
+):
+    """Artifact acquisitions touching a primary-title holder.
+
+    Walks ``artifacts.artifacts``; for each artifact whose history mentions
+    a holder_id as recipient (inherited/purchased/gifted/looted), emits
+    the acquisition event. Capped early because saves can carry 6000+
+    artifacts.
+    """
+    arts = ((parsed.get("artifacts") or {}).get("artifacts")) or {}
+    if not isinstance(arts, dict):
+        return
+    emitted = 0
+    interesting_types = {"inherited", "purchased", "gifted", "looted",
+                         "created", "claimed", "stolen"}
+    for aid, a in arts.items():
+        if emitted >= max_artifacts:
+            return
+        if not isinstance(a, dict):
+            continue
+        hist = (a.get("history") or {}).get("entries") if isinstance(a.get("history"), dict) else None
+        if not isinstance(hist, list):
+            continue
+        for entry in hist:
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("type")
+            if entry_type not in interesting_types:
+                continue
+            recipient = entry.get("recipient")
+            if recipient is None or str(recipient) not in holder_ids:
+                continue
+            date = _parse_date(entry.get("date"))
+            if not date:
+                continue
+            y, m, d = date
+            if y < from_year or y > to_year:
+                continue
+            actor = _enrich(_make_actor(str(recipient), chars))
+            art_name = a.get("name") or "an unnamed object"
+            art_type = a.get("type") or "artifact"
+            rarity = a.get("rarity") or "common"
+            eid = make_event_id(
+                Source.SAVE_IMPORT, EventType.ARTIFACT_ACQUIRED, y,
+                salt_parts=[str(aid), entry_type, str(recipient), str(y)],
+            )
+            yield ChronicleEvent(
+                event_id=eid, source=Source.SAVE_IMPORT, type=EventType.ARTIFACT_ACQUIRED,
+                year=y, month=m, day=d,
+                primary_actors=[actor], outcome=Outcome.SUCCESS,
+                tags=[entry_type, f"rarity:{rarity}", f"artifact_type:{art_type}",
+                      f"title:{title_label}"]
+                     + ([f"house:{house_name}"] if house_name else []),
+                raw_excerpt=json.dumps({
+                    "artifact_name": art_name,
+                    "artifact_type": art_type,
+                    "rarity": rarity,
+                    "acquisition_mode": entry_type,
+                    "description": (a.get("description") or "")[:300],
+                }, ensure_ascii=False)[:700],
+                world_context=world_context,
+            )
+            emitted += 1
+            break  # one acquisition event per artifact
+
+
+def _extract_activities(
+    *, parsed: dict, current_holder_id: str, chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str, from_year: int, to_year: int,
+):
+    """Activities the player has hosted or attended.
+
+    CK3 doesn't store a full per-activity history per character, but it
+    does keep ``last_open_activity_dates`` and ``last_hosted_activity_dates``
+    in ``played_character`` — one entry per activity type, dated to the
+    most recent occurrence. That's enough for "in the seventh year of his
+    reign His Majesty held the imperial examinations" kind of entries.
+    """
+    pc = parsed.get("played_character") or {}
+    sections = [
+        ("hosted", pc.get("last_hosted_activity_dates") or {}),
+        ("attended", pc.get("last_open_activity_dates") or {}),
+    ]
+    for role, table in sections:
+        if not isinstance(table, dict):
+            continue
+        for activity_type, date_s in table.items():
+            date = _parse_date(date_s)
+            if not date:
+                continue
+            y, m, d = date
+            if y < from_year or y > to_year:
+                continue
+            actor = _enrich(_make_actor(current_holder_id, chars))
+            # Pretty label: 'activity_imperial_examination' → 'imperial_examination'
+            pretty = activity_type
+            if isinstance(activity_type, str) and activity_type.startswith("activity_"):
+                pretty = activity_type[len("activity_"):]
+            eid = make_event_id(
+                Source.SAVE_IMPORT, EventType.ACTIVITY, y,
+                salt_parts=[current_holder_id, role, activity_type, str(y), str(m), str(d)],
+            )
+            yield ChronicleEvent(
+                event_id=eid, source=Source.SAVE_IMPORT, type=EventType.ACTIVITY,
+                year=y, month=m, day=d,
+                primary_actors=[actor], outcome=Outcome.SUCCESS,
+                tags=[f"activity:{pretty}", f"role:{role}",
+                      f"title:{title_label}"]
+                     + ([f"house:{house_name}"] if house_name else []),
+                raw_excerpt=json.dumps({
+                    "activity_type": activity_type,
+                    "role": role,
+                    "note": "Dated to the most recent occurrence; CK3 only stores latest per type.",
+                }, ensure_ascii=False)[:300],
+                world_context=world_context,
+            )
+
+
+def _extract_marriages(
+    *, parsed: dict, current_holder_id: str, chars: dict,
+    house_name: str | None, title_label: str,
+    world_context: str, from_year: int, to_year: int,
+):
+    """Marriage events for the reigning holder + their listed predecessors.
+
+    ``family_data`` carries spouse character ids but no date. We approximate
+    by taking the holder's first child's birth date and subtracting one year
+    (a reasonable medieval anchor: a child within the first year of marriage
+    is typical). Where no children exist we fall back to the holder's own
+    accession date.
+
+    We only emit marriages where we can find a credible anchor date.
+    """
+    # The holders we care about: current + any in the primary title's history
+    # is already collected by the caller and passed via current_holder_id.
+    # For this extractor we'll just do the current holder and primary spouse.
+    holder = chars.get(current_holder_id) or {}
+    fd = holder.get("family_data") or {}
+    spouse_id = fd.get("primary_spouse") or fd.get("spouse")
+    if spouse_id is None:
+        return
+    spouse_id = str(spouse_id)
+    if not chars.get(spouse_id):
+        return
+    # Anchor date: eldest child's birth minus one year, else accession.
+    anchor: tuple[int, int, int] | None = None
+    for cid in fd.get("child") or []:
+        c = chars.get(str(cid))
+        if isinstance(c, dict):
+            b = _parse_date(c.get("birth"))
+            if b and (anchor is None or b < anchor):
+                anchor = b
+    if anchor is not None:
+        # Subtract a year-ish, clamp to month 1.
+        ay, am, ad_ = anchor
+        anchor = (max(1, ay - 1), 1, 1)
+    if anchor is None:
+        ld = holder.get("landed_data") or {}
+        anchor = _parse_date(ld.get("became_ruler_date"))
+    if anchor is None:
+        return
+    y, m, d = anchor
+    if y < from_year or y > to_year:
+        return
+    actor = _enrich(_make_actor(current_holder_id, chars))
+    spouse_actor = _enrich(_make_actor(spouse_id, chars))
+    eid = make_event_id(
+        Source.SAVE_IMPORT, EventType.MARRIAGE, y,
+        salt_parts=[current_holder_id, spouse_id, str(y)],
+    )
+    yield ChronicleEvent(
+        event_id=eid, source=Source.SAVE_IMPORT, type=EventType.MARRIAGE,
+        year=y, month=m, day=d,
+        primary_actors=[actor, spouse_actor], outcome=Outcome.SUCCESS,
+        tags=["primary_spouse", f"title:{title_label}"]
+             + ([f"house:{house_name}"] if house_name else []),
+        raw_excerpt=json.dumps({
+            "anchor_method": "first_child_birth_minus_one_year",
+            "spouse_name": spouse_actor.name,
+            "note": "CK3 saves don't store marriage dates directly; this anchor is approximate.",
+        }, ensure_ascii=False)[:400],
+        world_context=world_context,
+    )
+
+
 # ---------- per-type cap ----------
 
 
@@ -472,6 +896,8 @@ def main():
     ap.add_argument("--to-year", type=int, default=None)
     ap.add_argument("--max-per-type", type=int, default=6,
                     help="Keep at most N events of each EventType (newest first).")
+    ap.add_argument("--max-artifacts", type=int, default=6,
+                    help="Hard cap on artifact extractor (saves can hold 6000+).")
     ap.add_argument("--player", type=int, default=None,
                     help="Override player char id. Default: played_character.character")
     args = ap.parse_args()
@@ -599,6 +1025,66 @@ def main():
         house_name=house_name, title_label=title_label,
     ))
     print(f"[info] holder traits (illness/disability/aging): {len(events) - n0}", flush=True)
+
+    # 7. Past battles commanded by any holder in our touched set.
+    n0 = len(events)
+    events.extend(_extract_battles(
+        parsed=parsed, holder_ids=touched_holders, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+        from_year=args.from_year, to_year=args.to_year,
+    ))
+    print(f"[info] past battles: {len(events) - n0}", flush=True)
+
+    # 8. Active schemes (player as owner or target).
+    n0 = len(events)
+    events.extend(_extract_player_schemes(
+        parsed=parsed, current_holder_id=pid, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+    ))
+    print(f"[info] active schemes: {len(events) - n0}", flush=True)
+
+    # 9. Active stories owned by the reigning ruler.
+    n0 = len(events)
+    events.extend(_extract_player_stories(
+        parsed=parsed, current_holder_id=pid, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+        from_year=args.from_year, to_year=args.to_year,
+    ))
+    print(f"[info] stories: {len(events) - n0}", flush=True)
+
+    # 10. Artifacts acquired by any holder in our touched set.
+    n0 = len(events)
+    events.extend(_extract_artifacts(
+        parsed=parsed, holder_ids=touched_holders, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+        from_year=args.from_year, to_year=args.to_year,
+        max_artifacts=args.max_artifacts,
+    ))
+    print(f"[info] artifacts: {len(events) - n0}", flush=True)
+
+    # 11. Activities hosted / attended by the reigning ruler.
+    n0 = len(events)
+    events.extend(_extract_activities(
+        parsed=parsed, current_holder_id=pid, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+        from_year=args.from_year, to_year=args.to_year,
+    ))
+    print(f"[info] activities: {len(events) - n0}", flush=True)
+
+    # 12. Approximate marriage event for the current holder.
+    n0 = len(events)
+    events.extend(_extract_marriages(
+        parsed=parsed, current_holder_id=pid, chars=chars,
+        house_name=house_name, title_label=title_label,
+        world_context=world_context,
+        from_year=args.from_year, to_year=args.to_year,
+    ))
+    print(f"[info] marriages: {len(events) - n0}", flush=True)
 
     # Cap per type.
     before = len(events)

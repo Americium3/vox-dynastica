@@ -32,8 +32,12 @@
         "great_holy_war",
         "scheme_success",
         "scheme_failure",
+        "scheme_active",
         "artifact_acquired",
-        "disaster"
+        "disaster",
+        "battle",
+        "activity",
+        "story_event"
       ]
     },
     "year": {

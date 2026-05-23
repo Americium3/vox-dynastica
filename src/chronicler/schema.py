@@ -32,8 +32,12 @@ class EventType(str, Enum):
     GREAT_HOLY_WAR = "great_holy_war"
     SCHEME_SUCCESS = "scheme_success"
     SCHEME_FAILURE = "scheme_failure"
+    SCHEME_ACTIVE = "scheme_active"
     ARTIFACT_ACQUIRED = "artifact_acquired"
     DISASTER = "disaster"
+    BATTLE = "battle"
+    ACTIVITY = "activity"
+    STORY_EVENT = "story_event"
 
 
 class FactionSide(str, Enum):
