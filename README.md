@@ -29,7 +29,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 ## Quickstart
 
 ```bash
-git clone https://github.com/EndingEra/codex-dynastica.git
+git clone https://github.com/Americium3/codex-dynastica.git
 cd ck3-ai-chronicler
 python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -e ".[dev]"

@@ -35,8 +35,8 @@ dev = [
 chronicler = "chronicler.cli:main"
 
 [project.urls]
-"Source" = "https://github.com/EndingEra/codex-dynastica"
-"Issues" = "https://github.com/EndingEra/codex-dynastica/issues"
+"Source" = "https://github.com/Americium3/codex-dynastica"
+"Issues" = "https://github.com/Americium3/codex-dynastica/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
