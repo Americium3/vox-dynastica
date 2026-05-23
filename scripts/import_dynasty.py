@@ -1,4 +1,33 @@
-"""Dynastic-scope importer — Phase 0.1.
+"""Dynastic-scope importer — Phase 0.1 / 0.2.
+
+Phase 0.2 adds a player-selectable ``--scope`` flag that broadens (or
+narrows) the chronicle's eye on top of the dynastic spine:
+
+  ``dynastic`` (default, Phase 0.1 behaviour)
+      Just the primary title's holder line + heirs + wars + traits +
+      schemes/stories/artifacts/activities/marriages of the present
+      holder. Tight, focused, recommended for landed rulers.
+
+  ``narrow``
+      Strip down to the player's own house only: births, deaths, and
+      marriages of dynastic-house members in the window. Suitable for
+      landless adventurers whose bloodline is the unit, and for landed
+      rulers who want a family-album feel.
+
+  ``middle``
+      ``narrow`` + ``dynastic``. House-member life events overlaid on
+      the primary-title spine. The default sweet spot when in doubt.
+
+  ``wide``
+      ``middle`` + every notable landed death in the window (titled
+      rulers anywhere in the known world). Capped hard via
+      ``--max-per-type`` because saves carry tens of thousands of
+      deaths.
+
+Implementation note: rather than three sibling scripts, all scopes flow
+through this one driver. ``scripts/import_narrow.py`` and
+``scripts/import_real_save.py`` remain as historical prototypes — the
+single CLI surface here is what Phase 0.2 ships.
 
 Vox Dynastica's spine is the **primary title**. This script walks the
 player's primary title (``landed_data.domain[0]`` by CK3's precedence
@@ -947,6 +976,144 @@ def _extract_marriages(
     )
 
 
+# ---------- Phase 0.2: scope-widening extractors ----------
+
+
+def _extract_house_lifecycle(
+    *, chars: dict, house_id, house_name: str | None,
+    world_context: str, from_year: int, to_year: int,
+):
+    """Births + deaths of every dynastic-house member within window.
+
+    Powers ``--scope narrow`` (the family-album view) and is also folded
+    into ``middle`` and ``wide`` on top of the dynastic spine.
+    """
+    if house_id is None:
+        return
+    for cid, c in chars.items():
+        if not isinstance(c, dict):
+            continue
+        if c.get("dynasty_house") != house_id:
+            continue
+        # Birth.
+        b = _parse_date(c.get("birth"))
+        if b and from_year <= b[0] <= to_year:
+            y, m, d = b
+            actor = _enrich(_make_actor(str(cid), chars))
+            eid = make_event_id(
+                Source.SAVE_IMPORT, EventType.BIRTH, y,
+                salt_parts=[str(cid), "house_birth", str(y)],
+            )
+            yield ChronicleEvent(
+                event_id=eid, source=Source.SAVE_IMPORT, type=EventType.BIRTH,
+                year=y, month=m, day=d,
+                primary_actors=[actor], outcome=Outcome.SUCCESS,
+                tags=["house_member"] + ([f"house:{house_name}"] if house_name else []),
+                raw_excerpt=json.dumps({
+                    "relation_to_player": "house_member",
+                    "house": house_name,
+                }, ensure_ascii=False)[:300],
+                world_context=world_context,
+            )
+        # Death.
+        dd = c.get("dead_data") or {}
+        if not isinstance(dd, dict):
+            continue
+        date = _parse_date(dd.get("date"))
+        if not date:
+            continue
+        y, m, d = date
+        if y < from_year or y > to_year:
+            continue
+        reason = str(dd.get("reason") or "")
+        is_murder = (
+            reason in MURDER_REASONS or "murder" in reason or "assassin" in reason
+        )
+        et = EventType.MURDER if is_murder else EventType.RULER_DEATH
+        actor = _enrich(
+            _make_actor(str(cid), chars),
+            titles=dd.get("domain") if isinstance(dd.get("domain"), list) else [],
+        )
+        eid = make_event_id(
+            Source.SAVE_IMPORT, et, y,
+            salt_parts=[str(cid), "house_death", reason, str(y)],
+        )
+        yield ChronicleEvent(
+            event_id=eid, source=Source.SAVE_IMPORT, type=et,
+            year=y, month=m, day=d,
+            primary_actors=[actor],
+            outcome=Outcome.FAILURE if is_murder else Outcome.NATURAL,
+            tags=["house_member", reason or "unknown_cause"]
+                 + ([f"house:{house_name}"] if house_name else []),
+            raw_excerpt=json.dumps({
+                "dead_data": dd, "relation_to_player": "house_member",
+                "house": house_name,
+            }, ensure_ascii=False)[:600],
+            world_context=world_context,
+        )
+
+
+def _extract_notable_landed_deaths(
+    *, chars: dict, world_context: str, from_year: int, to_year: int,
+    exclude_ids: set[str], max_events: int,
+):
+    """Every titled ruler's death anywhere in the known world.
+
+    Powers ``--scope wide``. ``exclude_ids`` skips characters already
+    surfaced by other extractors. Capped early — saves carry 90k+ dead
+    NPCs; only landed/titled ones with a death cause make the cut.
+    """
+    out: list[ChronicleEvent] = []
+    for cid, c in chars.items():
+        if str(cid) in exclude_ids:
+            continue
+        if not isinstance(c, dict):
+            continue
+        dd = c.get("dead_data") or {}
+        if not isinstance(dd, dict):
+            continue
+        reason = dd.get("reason")
+        if not reason:
+            continue
+        if not (dd.get("domain") or dd.get("liege_title")):
+            continue
+        date = _parse_date(dd.get("date"))
+        if not date:
+            continue
+        y, m, d = date
+        if y < from_year or y > to_year:
+            continue
+        out.append((date, cid, c, str(reason), dd))
+    # Keep the latest N (closest to the save's present).
+    out.sort(key=lambda t: t[0])
+    out = out[-max_events:]
+    for date, cid, c, reason, dd in out:
+        y, m, d = date
+        is_murder = (
+            reason in MURDER_REASONS or "murder" in reason or "assassin" in reason
+        )
+        et = EventType.MURDER if is_murder else EventType.RULER_DEATH
+        actor = _enrich(
+            _make_actor(str(cid), chars),
+            titles=dd.get("domain") if isinstance(dd.get("domain"), list) else [],
+        )
+        eid = make_event_id(
+            Source.SAVE_IMPORT, et, y,
+            salt_parts=[str(cid), "notable_death", reason, str(y)],
+        )
+        yield ChronicleEvent(
+            event_id=eid, source=Source.SAVE_IMPORT, type=et,
+            year=y, month=m, day=d,
+            primary_actors=[actor],
+            outcome=Outcome.FAILURE if is_murder else Outcome.NATURAL,
+            tags=["notable_ruler", reason or "unknown_cause"],
+            raw_excerpt=json.dumps({
+                "dead_data": dd, "relation_to_player": "foreign_ruler",
+            }, ensure_ascii=False)[:600],
+            world_context=world_context,
+        )
+
+
 # ---------- per-type cap ----------
 
 
@@ -979,6 +1146,18 @@ def main():
                     help="Hard cap on artifact extractor (saves can hold 6000+).")
     ap.add_argument("--player", type=int, default=None,
                     help="Override player char id. Default: played_character.character")
+    ap.add_argument(
+        "--scope",
+        choices=["dynastic", "narrow", "middle", "wide"],
+        default="dynastic",
+        help=(
+            "How wide the chronicle's eye should be. "
+            "dynastic = primary-title spine only (default). "
+            "narrow = player's own house births/deaths/marriages. "
+            "middle = narrow + dynastic. "
+            "wide = middle + every notable landed death in window."
+        ),
+    )
     args = ap.parse_args()
 
     if args.json is None and args.save is None:
@@ -1051,21 +1230,35 @@ def main():
     print(f"[info] house: {house_name}", flush=True)
     print(f"[info] window: {args.from_year}–{args.to_year} AD  (save date: {save_date})", flush=True)
     print(f"[info] cap per type: {args.max_per_type}", flush=True)
+    print(f"[info] scope: {args.scope}", flush=True)
+
+    # Scope flags. ``dynastic`` is the Phase 0.1 default — primary-title
+    # spine. ``narrow`` strips that down to the player's house alone.
+    # ``middle`` overlays both. ``wide`` further pulls notable foreign
+    # deaths for a world-scale chronicle.
+    do_dynastic = args.scope in {"dynastic", "middle", "wide"}
+    do_house = args.scope in {"narrow", "middle", "wide"}
+    do_world = args.scope == "wide"
 
     events: list[ChronicleEvent] = []
 
+    if not do_dynastic:
+        # Narrow still needs the contemporary-ruler timeline so dates
+        # have a regnal anchor, but skips emitting the spine events.
+        pass
+
     # 1+2. Title-history coronations + holder deaths.
     n0 = len(events)
-    events.extend(_extract_holder_history(
-        primary_id=primary_id, landed_titles=landed_titles, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-    ))
-    print(f"[info] coronations + holder deaths: {len(events) - n0}", flush=True)
+    if do_dynastic:
+        events.extend(_extract_holder_history(
+            primary_id=primary_id, landed_titles=landed_titles, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+        ))
+        print(f"[info] coronations + holder deaths: {len(events) - n0}", flush=True)
 
     # 3+4. Heir lifecycle for each holder we've touched in window.
-    n0 = len(events)
     touched_holders: set[str] = set()
     if isinstance(primary_title.get("history"), dict):
         for date_s, entry in primary_title["history"].items():
@@ -1079,94 +1272,119 @@ def main():
             elif isinstance(entry, dict) and entry.get("holder") is not None:
                 touched_holders.add(str(entry["holder"]))
     touched_holders.add(pid)  # current holder always
-    for holder_id in touched_holders:
-        events.extend(_extract_heir_lifecycle(
-            holder_id=holder_id, chars=chars,
+    if do_dynastic:
+        n0 = len(events)
+        for holder_id in touched_holders:
+            events.extend(_extract_heir_lifecycle(
+                holder_id=holder_id, chars=chars,
+                house_name=house_name, title_label=title_label,
+                world_context=world_context,
+                from_year=args.from_year, to_year=args.to_year,
+            ))
+        print(f"[info] heir births + heir deaths: {len(events) - n0}", flush=True)
+
+        # 5. Active wars where current holder participates.
+        n0 = len(events)
+        events.extend(_extract_active_wars(
+            parsed=parsed, current_holder_id=pid, chars=chars,
+            house_name=house_name, title_label=title_label,
+            save_date=save_date, world_context=world_context,
+        ))
+        print(f"[info] active wars: {len(events) - n0}", flush=True)
+
+        # 6. Current holder's significant traits.
+        traits_lookup = parsed.get("traits_lookup") or []
+        n0 = len(events)
+        events.extend(_extract_holder_traits(
+            current_holder_id=pid, chars=chars, traits_lookup=traits_lookup,
+            save_date=save_date, world_context=world_context,
+            house_name=house_name, title_label=title_label,
+        ))
+        print(f"[info] holder traits (illness/disability/aging): {len(events) - n0}", flush=True)
+
+        # 7. Past battles commanded by any holder in our touched set.
+        n0 = len(events)
+        events.extend(_extract_battles(
+            parsed=parsed, holder_ids=touched_holders, chars=chars,
             house_name=house_name, title_label=title_label,
             world_context=world_context,
             from_year=args.from_year, to_year=args.to_year,
         ))
-    print(f"[info] heir births + heir deaths: {len(events) - n0}", flush=True)
+        print(f"[info] past battles: {len(events) - n0}", flush=True)
 
-    # 5. Active wars where current holder participates.
-    n0 = len(events)
-    events.extend(_extract_active_wars(
-        parsed=parsed, current_holder_id=pid, chars=chars,
-        house_name=house_name, title_label=title_label,
-        save_date=save_date, world_context=world_context,
-    ))
-    print(f"[info] active wars: {len(events) - n0}", flush=True)
+        # 8. Active schemes (player as owner or target).
+        n0 = len(events)
+        events.extend(_extract_player_schemes(
+            parsed=parsed, current_holder_id=pid, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+        ))
+        print(f"[info] active schemes: {len(events) - n0}", flush=True)
 
-    # 6. Current holder's significant traits.
-    traits_lookup = parsed.get("traits_lookup") or []
-    n0 = len(events)
-    events.extend(_extract_holder_traits(
-        current_holder_id=pid, chars=chars, traits_lookup=traits_lookup,
-        save_date=save_date, world_context=world_context,
-        house_name=house_name, title_label=title_label,
-    ))
-    print(f"[info] holder traits (illness/disability/aging): {len(events) - n0}", flush=True)
+        # 9. Active stories owned by the reigning ruler.
+        n0 = len(events)
+        events.extend(_extract_player_stories(
+            parsed=parsed, current_holder_id=pid, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+        ))
+        print(f"[info] stories: {len(events) - n0}", flush=True)
 
-    # 7. Past battles commanded by any holder in our touched set.
-    n0 = len(events)
-    events.extend(_extract_battles(
-        parsed=parsed, holder_ids=touched_holders, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-    ))
-    print(f"[info] past battles: {len(events) - n0}", flush=True)
+        # 10. Artifacts acquired by any holder in our touched set.
+        n0 = len(events)
+        events.extend(_extract_artifacts(
+            parsed=parsed, holder_ids=touched_holders, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+            max_artifacts=args.max_artifacts,
+        ))
+        print(f"[info] artifacts: {len(events) - n0}", flush=True)
 
-    # 8. Active schemes (player as owner or target).
-    n0 = len(events)
-    events.extend(_extract_player_schemes(
-        parsed=parsed, current_holder_id=pid, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-    ))
-    print(f"[info] active schemes: {len(events) - n0}", flush=True)
+        # 11. Activities hosted / attended by the reigning ruler.
+        n0 = len(events)
+        events.extend(_extract_activities(
+            parsed=parsed, current_holder_id=pid, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+            reign_start_year=became_date[0] if became_date else None,
+        ))
+        print(f"[info] activities: {len(events) - n0}", flush=True)
 
-    # 9. Active stories owned by the reigning ruler.
-    n0 = len(events)
-    events.extend(_extract_player_stories(
-        parsed=parsed, current_holder_id=pid, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-    ))
-    print(f"[info] stories: {len(events) - n0}", flush=True)
+        # 12. Approximate marriage event for the current holder.
+        n0 = len(events)
+        events.extend(_extract_marriages(
+            parsed=parsed, current_holder_id=pid, chars=chars,
+            house_name=house_name, title_label=title_label,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+        ))
+        print(f"[info] marriages: {len(events) - n0}", flush=True)
 
-    # 10. Artifacts acquired by any holder in our touched set.
-    n0 = len(events)
-    events.extend(_extract_artifacts(
-        parsed=parsed, holder_ids=touched_holders, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-        max_artifacts=args.max_artifacts,
-    ))
-    print(f"[info] artifacts: {len(events) - n0}", flush=True)
+    # 13. (Phase 0.2) House lifecycle — narrow / middle / wide.
+    if do_house:
+        n0 = len(events)
+        events.extend(_extract_house_lifecycle(
+            chars=chars, house_id=house_id, house_name=house_name,
+            world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+        ))
+        print(f"[info] house lifecycle (births+deaths): {len(events) - n0}", flush=True)
 
-    # 11. Activities hosted / attended by the reigning ruler.
-    n0 = len(events)
-    events.extend(_extract_activities(
-        parsed=parsed, current_holder_id=pid, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-        reign_start_year=became_date[0] if became_date else None,
-    ))
-    print(f"[info] activities: {len(events) - n0}", flush=True)
-
-    # 12. Approximate marriage event for the current holder.
-    n0 = len(events)
-    events.extend(_extract_marriages(
-        parsed=parsed, current_holder_id=pid, chars=chars,
-        house_name=house_name, title_label=title_label,
-        world_context=world_context,
-        from_year=args.from_year, to_year=args.to_year,
-    ))
-    print(f"[info] marriages: {len(events) - n0}", flush=True)
+    # 14. (Phase 0.2) Notable foreign rulers' deaths — wide only.
+    if do_world:
+        already = {a.character_id for ev in events for a in ev.primary_actors}
+        n0 = len(events)
+        events.extend(_extract_notable_landed_deaths(
+            chars=chars, world_context=world_context,
+            from_year=args.from_year, to_year=args.to_year,
+            exclude_ids=already,
+            # Honour the per-type cap so wide doesn't drown narrow.
+            max_events=max(args.max_per_type * 2, 10),
+        ))
+        print(f"[info] notable foreign deaths: {len(events) - n0}", flush=True)
 
     # Per-event contemporary-ruler anchor. CK3's "Nth year of his reign"
     # phrasing is meaningful only with this stamped per event; without it

@@ -262,7 +262,7 @@ class Agent(ABC):
         self,
         client: LLMClient,
         *,
-        max_tokens: int = 800,
+        max_tokens: int = 350,
         model_override: Optional[str] = None,
     ):
         self.client = client
