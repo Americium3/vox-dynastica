@@ -44,15 +44,16 @@ Real saves break the broad extractor (a 1034 save has 93k dead characters). Phas
 - [ ] Cost-curve benchmarking on 3–5 diverse real saves
 - [ ] Recover wars / coronations / marriages from saves with the newer `landed_titles[*].history` shape (Phase 0 default extractor still misses these)
 
-## Phase 0.2 — Player-selectable scope: narrow / middle / wide
+## Phase 0.2 — Player-selectable scope + shorter chronicles ✅
 
-Add a single CLI flag (and, in Phase 1, an in-game setting) so the player can choose how wide the chronicle's eye should be:
+A single ``--scope`` CLI flag on ``scripts/import_dynasty.py`` (and, in Phase 1, an in-game setting) lets the player choose how wide the chronicle's eye should be. All scope tiers flow through one CLI surface; the standalone prototype scripts ``import_narrow.py`` / ``import_real_save.py`` remain as historical references only.
 
-- [ ] **narrow** — player's own dynastic house only. Births, deaths, marriages of house members. Suitable for landed rulers who want a family chronicle and for landless adventurers whose bloodline is still the unit.
-- [ ] **middle** — narrow PLUS the lieges of any realms the player has resided in. Designed for landless adventurer playthroughs where the realm is borrowed, not owned.
-- [ ] **wide** — every prominent ruler in the known world (the original Phase 0 default).
-- [ ] Per-type subquotas and recency windows configurable per scope.
-- [ ] Auto-pick a sensible scope from the player's lifestyle (landed → dynastic, wandering → middle, ironman → narrow).
+- [x] **dynastic** (default) — primary-title spine: holder line, heirs, wars, traits, schemes, stories, artifacts, activities, marriages.
+- [x] **narrow** — player's own dynastic house only. Births + deaths of house members in the window. Suitable for landed rulers who want a family chronicle and for landless adventurers whose bloodline is still the unit.
+- [x] **middle** — narrow + dynastic. House-member life events overlaid on the primary-title spine. The default sweet spot when in doubt.
+- [x] **wide** — middle + every notable landed death in the window across the known world (capped via ``--max-per-type`` because saves carry 90k+ dead NPCs).
+- [x] **Shorter chronicles** — Court Historian now targets 1–2 short paragraphs / ~70–130 words (was 2–5 paragraphs / 150–280 words). Peasant Ballad targets 4–10 lines / ~30–70 words (was 8–20 lines / 60–140 words). Default ``max_tokens`` dropped from 800 → 350. Online players can't wait on novella-length entries per event.
+- [ ] Auto-pick a sensible scope from the player's lifestyle (landed → dynastic, wandering → middle, ironman → narrow). Deferred — comes with the in-game UI in Phase 1.
 
 ## Phase 1 — In-game Royal Library UI + cloud-API picker
 
